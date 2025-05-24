@@ -14,6 +14,7 @@
 #include "esp_nimble_cfg.h"
 #include "host/ble_hs.h"
 #include "esp_log.h"
+#include "ble_service_defines.h"
 
 TaskHandle_t            g_hostTask = nullptr;
 
@@ -127,15 +128,15 @@ static int gap_scan_callback(struct ble_gap_event *event, void *arg) {
             ESP_LOGW(TAG, "广播数据解析失败\n");
             return 0;
         }
+        // 过滤掉非cubicat设备
         auto name = std::string((const char*)fields.name, fields.name_len);
-        if (fields.name_len == 0) {
-            printf("name len: 0\n");
-        } else {
-            printf("name : %s\n", name.c_str());
+        if (fields.mfg_data_len == 4) {
+            uint16_t* mfg = (uint16_t*)fields.mfg_data;
+            if (mfg[0] == CUBICAT_SERVICE_UUID) {
+                bool connectable = disc->event_type == BLE_HCI_ADV_TYPE_ADV_IND || disc->event_type == BLE_HCI_ADV_TYPE_ADV_DIRECT_IND_HD;
+                BLEClient::getInstance()->onDeviceFound(disc->addr.val, disc->addr.type, name, mfg[1], connectable);
+            }
         }
-        printf("flags type: %d addr type: %d \n", fields.flags, disc->addr.type);
-        bool connectable = disc->event_type == BLE_HCI_ADV_TYPE_ADV_IND || disc->event_type == BLE_HCI_ADV_TYPE_ADV_DIRECT_IND_HD;
-        BLEClient::getInstance()->onDeviceFound(disc->addr.val, disc->addr.type, name, connectable);
     } else if (event->type == BLE_GAP_EVENT_CONNECT) {
         if (event->connect.status == 0) {
             struct ble_gap_conn_desc desc;
@@ -171,16 +172,6 @@ static int chr_disc_callback(uint16_t conn_handle, const struct ble_gatt_error *
                             const struct ble_gatt_chr *chr, void *arg) {
     uint16_t* servId = (uint16_t*)arg;
     if (error->status == 0) {
-        // 示例：如果特征支持读操作
-        if (chr->properties & BLE_GATT_CHR_PROP_READ) {
-   
-        }
-        // 示例：如果特征支持通知（订阅）
-        if (chr->properties & BLE_GATT_CHR_PROP_NOTIFY) {
-            // uint8_t notify_enable[] = {0x01, 0x00}; // 启用通知的CCC值
-            // ble_gattc_write_flat(conn_handle, chr->val_handle + 1, 
-            //                    notify_enable, sizeof(notify_enable), NULL, NULL);
-        }
         BLEClient::getInstance()->onCharacteristicFound(conn_handle, *servId, chr->uuid.u16.value, chr->val_handle, chr->properties);
     } else if (error->status == BLE_HS_EDONE) {
         delete servId;
@@ -260,7 +251,7 @@ void BLEClient::autoConnect(void* arg) {
     }
 }
 
-const BLEDevice* BLEClient::onDeviceFound(MacAddr addr, uint8_t addrType, std::string name, bool connectable) {
+const BLEDevice* BLEClient::onDeviceFound(MacAddr addr, uint8_t addrType, std::string name, uint16_t vendor, bool connectable) {
     auto dev = getDevice(addr);
     if (dev) {
         if (dev->name.empty())
@@ -280,6 +271,7 @@ const BLEDevice* BLEClient::onDeviceFound(MacAddr addr, uint8_t addrType, std::s
         .addrType = addrType,
         .connHandle = 0,
         .name = name,
+        .vendor = vendor
     };
     // Start to connect if set as auto connect
     if (m_devices.empty() && m_bAutoConnect) {
@@ -436,16 +428,6 @@ int ble_gatt_attr_callback(uint16_t conn_handle,
         ESP_LOGE(TAG,"Error: Failed to read attribute; rc=%d", error->status);
         return error->status;
     }
-    auto chr = BLEClient::getInstance()->getCharacteristicByHanle(conn_handle, attr->handle);
-    if (chr) {
-        printf("读取到 handle: %d, characteristic uuid: 0x%04X, 特征数据: ", attr->handle, chr->uuid);
-        print_mbuf(attr->om);
-        printf("\n");
-        if (chr->uuid == CHR_NAME) {
-            printf("设备名称: %s\n", std::string((const char*)attr->om->om_data, attr->om->om_len).c_str()); // attr->om->om_len, attr->om->om_data);
-            printf("\n");
-        }
-    }
     return 0;
 }
 bool BLEClient::read(uint16_t connHandle, uint16_t charUUID) {
@@ -457,7 +439,7 @@ bool BLEClient::read(uint16_t connHandle, uint16_t charUUID) {
     return false;
 }
 
-bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, uint8_t* data, uint16_t dataLen) {
+bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, const uint8_t* data, uint16_t dataLen) {
     auto chr = getCharacteristicByUUID(connHandle, charUUID);
     if (chr) {
         bool hasWriteRsp = chr->property & PROPERTY_WRITE_RSP;
@@ -475,6 +457,10 @@ bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, uint8_t* data, uin
         }
     }
     return false;
+}
+
+bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, const BLEProtocol& protocol) {
+    return write(connHandle, charUUID, protocol.getBuffer().data(), protocol.getBuffer().size());
 }
 
 #endif // 

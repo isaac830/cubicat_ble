@@ -18,6 +18,7 @@ extern "C" {
 #include "nvs_flash.h"
 #include "services/dis/ble_svc_dis.h"   
 }
+#include "ble_service_defines.h"
 
 #define TAG "BLE_SERVER"
 
@@ -112,9 +113,7 @@ BLECharacteristic* BLEService::getCharacteristic(uint16_t uuid) {
 const std::vector<ble_gatt_chr_def>& BLEService::getCharacteristicsDefs() {
     m_CharacteristicDefs.clear();
     for (auto& chr : m_Characteristics) {
-        m_CharacteristicDefs.push_back(chr->getDef());     
-        printf("AAA  BLEService characteristic uuid: %p cpfd: %p\n", chr->getDef().uuid, chr->getDef().cpfd);
-        printf("BBB  BLEService characteristic uuid: %p cpdf: %p\n", m_CharacteristicDefs[0].uuid, m_CharacteristicDefs[0].cpfd);   
+        m_CharacteristicDefs.push_back(chr->getDef());      
     }
     m_CharacteristicDefs.push_back({ 0 });
     return m_CharacteristicDefs;
@@ -141,9 +140,10 @@ BLEServer::~BLEServer()
     }
 }
 
-void BLEServer::init(std::string deviceName)
+void BLEServer::init(uint16_t vendorId, std::string deviceName)
 {
     m_deviceName = deviceName;
+    m_vendorId = vendorId;
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -230,10 +230,17 @@ void BLEServer::start()
     vTaskDelay(200 / portTICK_PERIOD_MS);
 
     // Advertising data
+    uint8_t mfd[4];
+    mfd[0] = (uint8_t)(CUBICAT_SERVICE_UUID >> 8);
+    mfd[1] = (uint8_t)(CUBICAT_SERVICE_UUID & 0xFF);
+    mfd[2] = (uint8_t)(m_vendorId >> 8);
+    mfd[3] = (uint8_t)(m_vendorId & 0xFF);
     struct ble_hs_adv_fields fields = {
         .flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP, 
         .uuids16 = &serviceUUIDs.data()[0],      
         .num_uuids16 = (uint8_t)serviceUUIDs.size(),
+        .mfg_data = mfd,
+        .mfg_data_len = 4
     };
     rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {

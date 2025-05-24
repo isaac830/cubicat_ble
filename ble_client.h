@@ -8,6 +8,7 @@
 #include <deque>
 #include "ble_service.h"
 #include "esp_timer.h"
+#include "ble_protocol.h"
 
 // GATT standard properties
 #define PROPERTY_BROADCAST      0x01
@@ -29,6 +30,7 @@ struct BLEDevice {
     const uint8_t   addrType;
     uint16_t        connHandle;
     std::string     name;
+    uint16_t        vendor;
     std::vector<ServiceData> services;
 };
 
@@ -56,12 +58,13 @@ public:
     const CharacteristicData* getCharacteristicByHanle(uint16_t connHandle, uint16_t handle);
     
     bool read(uint16_t connHandle, uint16_t charUUID);
-    bool write(uint16_t connHandle, uint16_t charUUID, uint8_t* data, uint16_t dataLen);
+    bool write(uint16_t connHandle, uint16_t charUUID, const uint8_t* data, uint16_t dataLen);
+    bool write(uint16_t connHandle, uint16_t charUUID, const BLEProtocol& protocol);
 
     void setConnectedCallback(ConnectedCallback onDeviceConnected) { m_connectedCB = onDeviceConnected; }
     void connect(MacAddr addr);
     // Internal functions
-    const BLEDevice* onDeviceFound(MacAddr addr, uint8_t addrType, std::string name, bool connectable);
+    const BLEDevice* onDeviceFound(MacAddr addr, uint8_t addrType, std::string name, uint16_t vendor, bool connectable);
     void onDeviceConnected(MacAddr addr, uint16_t connHandle);
     void onServiceFound(uint16_t connHandle, uint16_t srvcUUID, uint16_t startHandle, uint16_t endHandle);
     void onCharacteristicFound(uint16_t connHandle, uint16_t srvcUUID, uint16_t charUUID, uint16_t handle, uint8_t property);

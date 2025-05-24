@@ -66,7 +66,7 @@ public:
     BLEServer();
     ~BLEServer();
 
-    void init(std::string deviceName = "Cubicat");
+    void init(uint16_t vendorId, std::string deviceName = "Cubicat");
     void deinit();
 
     BLEService* createService(uint16_t uuid);
@@ -75,6 +75,7 @@ public:
 private:
     std::vector<BLEService*>    m_services;
     std::string                 m_deviceName;
+    uint16_t                    m_vendorId;
     std::vector<ble_gatt_svc_def> m_ServiceDefs;
 };
 
