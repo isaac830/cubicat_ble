@@ -1,0 +1,32 @@
+#ifndef _EXAMPLE_SERVER_
+#define _EXAMPLE_SERVER_
+
+#include "ble_server.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "ble_protocol.h"
+#include "ble_service_defines.h"
+
+extern "C" void app_main() 
+{
+    BLEServer server;
+    uint16_t vendorId = 0x5555;                 // 厂商标识
+    const char* deviceName = "Cubicat Light";   // 设备名称
+    server.init(vendorId, deviceName);
+    auto service = server.createService(CUBICAT_SERVICE_UUID);
+    auto chr = service->createCharacteristic(CUBICAT_PROTOCOL_CHAR_UUID);
+    chr->addOperation(OP_LIGHT_SWITCH, [=](uint16_t connHandle, const OPData& value) {
+        // 处理开关指令
+    })->addOperation(OP_LIGHT_BRIGHTNESS, [=](uint16_t connHandle, const OPData& value) {
+        // 处理亮度指令
+    })->addOperation(OP_LIGHT_COLOR, [=](uint16_t connHandle, const OPData& value) {
+        // 处理颜色指令
+    });
+    server.start();
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+#endif // 

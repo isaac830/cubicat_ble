@@ -1,3 +1,10 @@
+/*
+* @author       Isaac
+* @date         2025-05-02
+* @license      MIT License
+* @copyright    Copyright (c) 2025 Deer Valley
+* @description  BLE client for esp32 using nimBLE framework
+*/
 #include "ble_client.h"
 #include "sdkconfig.h"
 
@@ -23,7 +30,7 @@ TaskHandle_t            g_hostTask = nullptr;
 
 extern "C" void ble_store_config_init();
 
-static int gap_scan_callback(struct ble_gap_event *event, void *arg);
+static int gap_event_callback(struct ble_gap_event *event, void *arg);
 static int chr_disc_callback(uint16_t conn_handle, const struct ble_gatt_error *error,
                           const struct ble_gatt_chr *chr, void *arg);
 
@@ -35,6 +42,61 @@ static void blemesh_on_reset(int reason)
 static void blemesh_on_sync(void)
 {
 
+}
+
+int ble_gatt_attr_callback(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr,
+                             void *arg)
+{
+    if (error->status != 0) {
+        ESP_LOGE(TAG,"Error: Failed to read attribute; rc=%d", error->status);
+        return error->status;
+    }
+    if (attr && attr->om) {
+        // Current chunk data length
+        uint16_t chunkLen = OS_MBUF_PKTLEN(attr->om);
+        // Cache current chunk
+#ifdef BLE_DEBUG
+        printf("Received %d bytes at offset %d\n", chunkLen, attr->offset);
+#endif
+        // Check if there is more data， equal to MTU - 3 mean current package reached max shatt size,there could be more
+        if (chunkLen == ble_att_mtu(conn_handle) - 3) {
+            // Calculate next offset：current offset + current chunk length
+            uint16_t nextOffset = attr->offset + chunkLen;
+            ble_gattc_read_long(conn_handle, attr->handle, nextOffset, ble_gatt_attr_callback, arg);
+        } else {
+            ReadFunc onRead = *(ReadFunc*)arg;
+            if (onRead) {
+                ExBuffer buffer(attr->om->om_data, attr->om->om_data + attr->om->om_len);
+                onRead(buffer);
+            }
+        }
+    }
+
+    return 0;
+}
+
+int ble_gatt_desc_callback(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr,
+                             void *arg)
+{
+    if (error->status != 0) {
+        ESP_LOGE(TAG,"Error: Failed to read descriptor; rc=%d", error->status);
+        return error->status;
+    }
+    if (attr) {
+        CharacteristicData* chr = (CharacteristicData*)arg;
+        int c = attr->om->om_len / sizeof(uint32_t);
+        unsigned int* data = (unsigned int*)attr->om->om_data;
+        for (int i = 0; i < c; i++) {
+            printf("OpCode: 0x%08x\n", data[i]);
+            chr->opCodes.push_back(data[i]);
+        }
+
+    }
+    return 0;
 }
 
 void ble_host_task(void *param)
@@ -76,6 +138,66 @@ static int blecent_should_connect(const struct ble_gap_disc_desc *disc)
     return 0;
 }
 
+static int gap_event_callback(struct ble_gap_event *event, void *arg) {
+    int rc;
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        if (event->disc.addr.type != BLE_ADDR_PUBLIC) {
+            return 0;
+        }
+        ble_gap_disc_desc *disc = &event->disc;
+        printf("发现设备 data: ");
+        for (int i = 0; i < disc->length_data; i++) {
+            printf("%02X ", disc->data[i]);
+        }
+        printf("\ndata len: %d \n", disc->length_data);
+        if (!disc->length_data) {
+            return 0;
+        }
+        struct ble_hs_adv_fields fields;
+        rc = ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "广播数据解析失败\n");
+            return 0;
+        }
+        auto name = std::string((const char*)fields.name, fields.name_len);
+        bool connectable = disc->event_type == BLE_HCI_ADV_TYPE_ADV_IND || disc->event_type == BLE_HCI_ADV_TYPE_ADV_DIRECT_IND_HD;
+        uint16_t vendor = 0;
+        if (fields.mfg_data_len >= 2) {
+            vendor = fields.mfg_data[0] << 8 | fields.mfg_data[1];
+        }
+        // 查找广播的uuid16里面是否包含cubicat服务
+        bool hasCubicatService = false;
+        for (int i = 0; i < fields.num_uuids16; i++) {
+            if (fields.uuids16[i].value == CUBICAT_SERVICE_UUID) {
+                hasCubicatService = true;
+                break;
+            }
+        }
+        printf("发现设备 name: %s, connectable: %d, vendor: %d, hasCubicatService: %d\n", name.c_str(), connectable, vendor, hasCubicatService);
+        BLEClient::getInstance()->onScanResult(disc->addr.val, disc->addr.type, name, hasCubicatService, vendor, connectable);
+    } else if (event->type == BLE_GAP_EVENT_CONNECT) {
+        if (event->connect.status == 0) {
+            // 连接成功后发起 MTU 协商
+            ble_gattc_exchange_mtu(event->connect.conn_handle, nullptr, nullptr);
+            struct ble_gap_conn_desc desc;
+            int rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "Failed to find connection; rc=%d", rc);
+                return 0;
+            }
+            BLEClient::getInstance()->onDeviceConnected(desc.peer_id_addr.val, event->connect.conn_handle);
+            // 保存连接信息
+            printf("连接成功\n");
+        } else {
+            printf("连接失败\n");
+        }
+        
+    } else if (event->type == BLE_GAP_EVENT_MTU) {
+        printf("Current MTU size: %d\n", event->mtu.value);
+    }
+    return 0;
+}
+
 void connectToDevice(const uint8_t* macAddr, uint8_t addrType) {
     // 连接之前必须停止扫描
     int rc = ble_gap_disc_cancel();
@@ -101,7 +223,7 @@ void connectToDevice(const uint8_t* macAddr, uint8_t addrType) {
         &addr,                // 目标设备地址
         BLE_HS_FOREVER,      // 持续尝试连接
         &conn_params,        
-        gap_scan_callback, 
+        gap_event_callback, 
         NULL
     );
     if (rc != 0) {
@@ -109,56 +231,10 @@ void connectToDevice(const uint8_t* macAddr, uint8_t addrType) {
              macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5], addrType);
     }
 }
-
-static int gap_scan_callback(struct ble_gap_event *event, void *arg) {
-    int rc;
-    if (event->type == BLE_GAP_EVENT_DISC) {
-        if (event->disc.addr.type != BLE_ADDR_PUBLIC) {
-            return 0;
-        }
-        ble_gap_disc_desc *disc = &event->disc;
-        printf("发现设备 data: ");
-        for (int i = 0; i < disc->length_data; i++) {
-            printf("%02X ", disc->data[i]);
-        }
-        printf("\ndata len: %d \n", disc->length_data);
-        struct ble_hs_adv_fields fields;
-        rc = ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "广播数据解析失败\n");
-            return 0;
-        }
-        // 过滤掉非cubicat设备
-        auto name = std::string((const char*)fields.name, fields.name_len);
-        if (fields.mfg_data_len == 4) {
-            uint16_t* mfg = (uint16_t*)fields.mfg_data;
-            if (mfg[0] == CUBICAT_SERVICE_UUID) {
-                bool connectable = disc->event_type == BLE_HCI_ADV_TYPE_ADV_IND || disc->event_type == BLE_HCI_ADV_TYPE_ADV_DIRECT_IND_HD;
-                BLEClient::getInstance()->onDeviceFound(disc->addr.val, disc->addr.type, name, mfg[1], connectable);
-            }
-        }
-    } else if (event->type == BLE_GAP_EVENT_CONNECT) {
-        if (event->connect.status == 0) {
-            struct ble_gap_conn_desc desc;
-            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-            if (rc != 0) {
-                ESP_LOGE(TAG,"Error: Failed to find connection; rc=%d", rc);
-                return rc;
-            }
-            BLEClient::getInstance()->onDeviceConnected(desc.peer_id_addr.val, event->connect.conn_handle);
-            // 保存连接信息
-            printf("连接成功\n");
-        } else {
-            printf("连接失败\n");
-        }
-        
-    }
-    return 0;
-}
 // 发现服务器回调
-static int gatt_disc_callback(uint16_t conn_handle, const ble_gatt_error *error, const ble_gatt_svc *service, void *arg) {
+static int serv_disc_callback(uint16_t conn_handle, const ble_gatt_error *error, const ble_gatt_svc *service, void *arg) {
     if (service) {
-        printf("发现服务 uuid: 0x%04X\n", service->uuid.u16.value);
+        printf("发现服务 uuid: 0x%04X start: 0x%04X end: 0x%04X\n", service->uuid.u16.value, service->start_handle, service->end_handle);
         if (error->status != 0) {
             ESP_LOGE(TAG,"Error: Failed to discover services; rc=%d", error->status);
             return error->status;
@@ -178,6 +254,41 @@ static int chr_disc_callback(uint16_t conn_handle, const struct ble_gatt_error *
         BLEClient::getInstance()->discoverCharacteristics(conn_handle, true);
     } else {
         printf("发现特征回调失败 status: %d\n", error->status);
+    }
+    return 0;
+}
+// 发现特征描述回调
+static int desc_disc_callback(uint16_t conn_handle, const struct ble_gatt_error *error, uint16_t chr_val_handle,
+                            const struct ble_gatt_dsc *dsc, void *arg)
+{
+    if (!dsc) {
+        return 0;
+    }
+    printf("发现描述 uuid: 0x%04X char val handle: 0x%04X\n", dsc->uuid.u16.value, chr_val_handle);
+    if (error->status != 0) {
+        // status 10: BLE_HS_EBADDATA
+        printf("发现描述回调失败 chr val handle: 0x%04X status: %d\n", chr_val_handle, error->status);
+        return error->status;
+    }
+    auto chr = (CharacteristicData*)arg;
+    if (dsc->uuid.u16.value == 0x2902) {
+        printf("Found CCCD handle: 0x%04X\n", dsc->handle);
+        chr->cccdHandle = dsc->handle;
+        // 开启通知
+        uint16_t enableFlag = 0x0000;
+        if (chr->property & PROPERTY_NOTIFY) {
+            enableFlag = 0x0001;
+        } else if (chr->property & PROPERTY_INDICATE) {
+            enableFlag = 0x0002;
+        }
+        if (enableFlag) {
+            int rc = ble_gattc_write_flat(conn_handle, dsc->handle, &enableFlag, sizeof(enableFlag), nullptr, nullptr);
+            if (rc != 0) {
+                ESP_LOGE(TAG,"Error: Failed to write CCCD; rc=%d", rc);
+            }
+        }
+    } else if (dsc->uuid.u16.value == CUBICAT_DESCRIPTOR_UUID) {
+        ble_gattc_read(conn_handle, dsc->handle, ble_gatt_desc_callback, chr);
     }
     return 0;
 }
@@ -219,7 +330,8 @@ void BLEClient::deinit() {
     }
 }
 
-void BLEClient::scan(bool autoConnect, int connectDelay) {
+void BLEClient::scan(ScanPolicy policy, bool autoConnect, int connectDelay) {
+    m_eScanPolicy = policy;
     m_bAutoConnect = autoConnect;
     m_connectDelay = connectDelay;
     uint8_t own_addr_type;
@@ -232,8 +344,8 @@ void BLEClient::scan(bool autoConnect, int connectDelay) {
         .passive = 0,   // 主动扫描（获取广播数据）
         .filter_duplicates = 1, // 过滤重复设备
     };
-    printf("开始扫描...\n");
-    ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &scan_params, gap_scan_callback, NULL);
+    ESP_LOGI(TAG, "Starting scan...\n");
+    ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &scan_params, gap_event_callback, NULL);
 }
 
 // Connect to all discovered devices
@@ -251,7 +363,13 @@ void BLEClient::autoConnect(void* arg) {
     }
 }
 
-const BLEDevice* BLEClient::onDeviceFound(MacAddr addr, uint8_t addrType, std::string name, uint16_t vendor, bool connectable) {
+void BLEClient::connect(const BLEDevice& device) {
+    if (device.connectable && device.connHandle == 0) {
+        connectToDevice(device.macAddr, device.addrType);
+    }
+}
+
+const BLEDevice* BLEClient::deviceFound(MacAddr addr, uint8_t addrType, std::string name, uint16_t vendor, bool connectable) {
     auto dev = getDevice(addr);
     if (dev) {
         if (dev->name.empty())
@@ -273,14 +391,13 @@ const BLEDevice* BLEClient::onDeviceFound(MacAddr addr, uint8_t addrType, std::s
         .name = name,
         .vendor = vendor
     };
-    // Start to connect if set as auto connect
+    // Start to connect after first discovery if set as auto connect
     if (m_devices.empty() && m_bAutoConnect) {
         const esp_timer_create_args_t timer_args = {
             .callback = &autoConnect,
             .arg = nullptr,
             .name = "AutoConnect",
         };
-        
         esp_timer_create(&timer_args, &m_sAutoConnectTimer);
         esp_timer_start_once(m_sAutoConnectTimer, m_connectDelay * 1000 * 1000); //（Units：us）
     }
@@ -308,7 +425,7 @@ BLEDevice* BLEClient::getDevice(uint16_t connHandle) {
     return nullptr;
 }
 
-const CharacteristicData* BLEClient::getCharacteristicByUUID(uint16_t connHandle, uint16_t uuid) {
+CharacteristicData* BLEClient::getCharacteristicByUUID(uint16_t connHandle, uint16_t uuid) {
     auto device = getDevice(connHandle);
     if (device) {
         for (auto& serv : device->services) {
@@ -322,7 +439,7 @@ const CharacteristicData* BLEClient::getCharacteristicByUUID(uint16_t connHandle
     return nullptr;
 }
 
-const CharacteristicData* BLEClient::getCharacteristicByHanle(uint16_t connHandle, uint16_t handle) {
+CharacteristicData* BLEClient::getCharacteristicByHanle(uint16_t connHandle, uint16_t handle) {
     auto device = getDevice(connHandle);
     if (device) {
         for (auto& characteristic : device->services) {
@@ -340,7 +457,7 @@ void BLEClient::onDeviceConnected(MacAddr addr, uint16_t connHandle) {
     auto device = getDevice(addr);
     if (device) {
         device->connHandle = connHandle;
-        int rc = ble_gattc_disc_all_svcs(device->connHandle, gatt_disc_callback, NULL);
+        int rc = ble_gattc_disc_all_svcs(device->connHandle, serv_disc_callback, NULL);
         if (rc != 0) {
             ESP_LOGE(TAG,"Error: Failed to discover services; rc=%d", rc);
         }
@@ -354,11 +471,22 @@ void BLEClient::onServiceFound(uint16_t conn_handle, uint16_t uuid, uint16_t sta
         discoverCharacteristics(conn_handle, false);
     }
 }
+
+void BLEClient::onScanResult(MacAddr addr, uint8_t addrType, std::string name, bool hasCubicatService,
+    uint16_t vendor, bool connectable) 
+{
+    // 过滤掉非cubicat设备
+    if (m_eScanPolicy == ScanPolicy::SCAN_ONLY_CUBICAT && !hasCubicatService) {
+        return;
+    }
+    BLEClient::getInstance()->deviceFound(addr, addrType, name, vendor, connectable);
+}
+
 void BLEClient::discoverCharacteristics(uint16_t connHandle, bool processNext) {
     if (processNext) {
         if (m_discServQueue.empty()) {
             m_bServInDiscovering = false;
-            // all characteristics discovered
+            // 所有特征发现完成
             if (m_connectedCB) {
                 m_connectedCB(connHandle);
             }
@@ -386,7 +514,14 @@ void BLEClient::onCharacteristicFound(uint16_t connHandle, uint16_t servUUID, ui
         printf("发现特征: UUID=0x%04X, property=0x%02X, handle=%d\n", charUUID, property, handle);
         for (auto& serv : device->services) {
             if (serv.uuid == servUUID) {
-                serv.chrData.emplace_back(CharacteristicData(charUUID, handle, property));
+                auto& chr = serv.chrData.emplace_back(CharacteristicData(charUUID, handle, property, 0, std::vector<uint32_t>()));
+                if (charUUID == CUBICAT_PROTOCOL_CHAR_UUID) {
+                    // Discover descriptors
+                    int rc = ble_gattc_disc_all_dscs(connHandle, serv.startHandle, serv.endHandle, desc_disc_callback, &chr);
+                    if (rc != 0) {
+                        ESP_LOGE(TAG,"Error: Failed to discover descriptors; rc=%d", rc);
+                    }
+                }
                 return;
             }
         }
@@ -405,8 +540,8 @@ print_bytes(const uint8_t *bytes, int len)
 void
 print_mbuf(const struct os_mbuf *om)
 {
+    printf("MBUF: ");
     int colon;
-
     colon = 0;
     while (om != NULL) {
         if (colon) {
@@ -417,23 +552,15 @@ print_mbuf(const struct os_mbuf *om)
         print_bytes(om->om_data, om->om_len);
         om = SLIST_NEXT(om, om_next);
     }
+    printf("\n");
 }
 
-int ble_gatt_attr_callback(uint16_t conn_handle,
-                             const struct ble_gatt_error *error,
-                             struct ble_gatt_attr *attr,
-                             void *arg)
-{
-    if (error->status != 0) {
-        ESP_LOGE(TAG,"Error: Failed to read attribute; rc=%d", error->status);
-        return error->status;
-    }
-    return 0;
-}
-bool BLEClient::read(uint16_t connHandle, uint16_t charUUID) {
+bool BLEClient::read(uint16_t connHandle, uint16_t charUUID, ReadFunc onRead) {
     auto chr = getCharacteristicByUUID(connHandle, charUUID);
     if (chr) {
-        ble_gattc_read(connHandle, chr->handle, ble_gatt_attr_callback, NULL);
+        // 协商MTU读取256字节，暂时不需要ble_gattc_read_long分片读取,如果有需要再修改
+        // ble_gattc_read_long(connHandle, chr->handle, 0, ble_gatt_attr_callback, &onRead);
+        ble_gattc_read(connHandle, chr->handle, ble_gatt_attr_callback, &onRead);
         return true;
     }
     return false;
@@ -450,9 +577,12 @@ bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, const uint8_t* dat
                 ESP_LOGE(TAG,"om buffer alloc failed");
                 return false;
             }
+#ifdef BLE_DEBUG
             printf("write characteristic: %04X, handle: %d, length: %d\n", chr->uuid, chr->handle, dataLen);
             print_mbuf(om);
-            ble_gattc_write(connHandle, chr->handle, om, hasWriteRsp?ble_gatt_attr_callback:NULL, NULL);
+#endif  
+            printf("has response: %d, has no response: %d\n", hasWriteRsp, hasWriteNoRsp);
+            ble_gattc_write(connHandle, chr->handle, om, hasWriteRsp?ble_gatt_attr_callback:NULL, nullptr);
             return true;
         }
     }
@@ -461,6 +591,18 @@ bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, const uint8_t* dat
 
 bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, const BLEProtocol& protocol) {
     return write(connHandle, charUUID, protocol.getBuffer().data(), protocol.getBuffer().size());
+}
+
+bool BLEClient::hasService(uint16_t connHandle, uint16_t servUUID) {
+    auto device = getDevice(connHandle);
+    if (device) {
+        for (auto& serv : device->services) {
+            if (serv.uuid == servUUID) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 #endif // 

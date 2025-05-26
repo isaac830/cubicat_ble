@@ -1,3 +1,10 @@
+/*
+* @author       Isaac
+* @date         2025-05-02
+* @license      MIT License
+* @copyright    Copyright (c) 2025 Deer Valley
+* @description  BLE client for esp32 using nimBLE framework
+*/
 #ifndef _BLE_CLIENT_
 #define _BLE_CLIENT_
 
@@ -34,8 +41,14 @@ struct BLEDevice {
     std::vector<ServiceData> services;
 };
 
-using ConnectedCallback = std::function<void(uint16_t)>;
+using ConnectedCallback = std::function<void(uint16_t connId)>;
 using MacAddr = uint8_t[6];
+using ReadFunc = std::function<void(const ExBuffer&)>;
+
+enum ScanPolicy {
+    SCAN_ONLY_CUBICAT,
+    SCAN_ALL_DEVICES
+};
 
 class BLEClient {
 public:
@@ -50,21 +63,22 @@ public:
     // @param connectDelay: if autoConnect is true, wait this many seconds before connecting
     //                      note: this is not the discovery duration, it is the delay after 
     //                      the first device is found, then the connection will begin
-    void scan(bool autoConnect = true, int connectDelay = 3);
+    void scan(ScanPolicy policy, bool autoConnect = true, int connectDelay = 2);
     const std::vector<BLEDevice>& getAllDevices();
     BLEDevice* getDevice(MacAddr addr);
     BLEDevice* getDevice(uint16_t connHandle);
-    const CharacteristicData* getCharacteristicByUUID(uint16_t connHandle, uint16_t charUUID);
-    const CharacteristicData* getCharacteristicByHanle(uint16_t connHandle, uint16_t handle);
+    CharacteristicData* getCharacteristicByUUID(uint16_t connHandle, uint16_t charUUID);
+    CharacteristicData* getCharacteristicByHanle(uint16_t connHandle, uint16_t handle);
     
-    bool read(uint16_t connHandle, uint16_t charUUID);
-    bool write(uint16_t connHandle, uint16_t charUUID, const uint8_t* data, uint16_t dataLen);
+    bool read(uint16_t connHandle, uint16_t charUUID, ReadFunc onRead);
     bool write(uint16_t connHandle, uint16_t charUUID, const BLEProtocol& protocol);
 
+    bool hasService(uint16_t connHandle, uint16_t servUUID);
     void setConnectedCallback(ConnectedCallback onDeviceConnected) { m_connectedCB = onDeviceConnected; }
-    void connect(MacAddr addr);
+    void connect(const BLEDevice& device);
     // Internal functions
-    const BLEDevice* onDeviceFound(MacAddr addr, uint8_t addrType, std::string name, uint16_t vendor, bool connectable);
+    void onScanResult(MacAddr addr, uint8_t addrType, std::string name, bool hasCubicatService,
+         uint16_t vendor, bool connectable);
     void onDeviceConnected(MacAddr addr, uint16_t connHandle);
     void onServiceFound(uint16_t connHandle, uint16_t srvcUUID, uint16_t startHandle, uint16_t endHandle);
     void onCharacteristicFound(uint16_t connHandle, uint16_t srvcUUID, uint16_t charUUID, uint16_t handle, uint8_t property);
@@ -72,7 +86,10 @@ public:
 private:
     BLEClient();
     BLEClient(BLEClient const&) = delete;
+
+    bool write(uint16_t connHandle, uint16_t charUUID, const uint8_t* data, uint16_t dataLen);
     static void autoConnect(void* arg);
+    const BLEDevice* deviceFound(MacAddr addr, uint8_t addrType, std::string name, uint16_t vendor, bool connectable);
     void getHandleRangeByCharHandle(uint8_t gattc_if, uint16_t charHandle, uint16_t* startHandle, uint16_t* endHandle);
     std::vector<BLEDevice>  m_devices;
     ConnectedCallback       m_connectedCB = nullptr;
@@ -82,6 +99,7 @@ private:
     bool                    m_bAutoConnect = false;
     int                     m_connectDelay = 0;
     static esp_timer_handle_t      m_sAutoConnectTimer;
+    ScanPolicy              m_eScanPolicy;
 };
 
 #endif
