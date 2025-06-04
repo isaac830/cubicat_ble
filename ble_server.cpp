@@ -30,10 +30,11 @@ extern "C" {
 
 #define TAG "BLE_SERVER"
 
-TaskHandle_t            g_slaveTask = nullptr;
-EventGroupHandle_t      g_startEvent = xEventGroupCreate();
+uint32_t timeSec() { return esp_timer_get_time() / 1000 / 1000; }
+uint32_t timeMillis() { return esp_timer_get_time() / 1000; }
 
-#define BLE_SERVER_START_BIT    BIT0
+#define BLE_SERVER_START_BIT                BIT0
+#define BLE_SERVER_REGISTER_GAP_EVENT_BIT   BIT1
 
 
 static int on_chr_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -80,21 +81,37 @@ static int on_dsc_access(uint16_t conn_handle, uint16_t attr_handle,
     }
     return 0;
 }
-// void NotifyOpCode(uint16_t connHandle, uint32_t opCode) {
-//     std::vector<uint8_t> opCodes;
-//     for (auto& opPair : m_opCallbacks) {
-//         if (opPair.first != OP_SYS_CONNECT) {
-//             opCodes.push_back(opPair.first);
-//         }
-//     }
-//     struct os_mbuf *txom = ble_hs_mbuf_from_flat(opCodes.data(), opCodes.size());
-//     int rc = ble_gatts_notify_custom(connHandle, m_data.handle, txom);
-//     if (rc != 0) {
-//         printf("Failed to send Notification: %d\n", rc);
-//     }
-// }
+// GAP event
+static int ble_gap_event(struct ble_gap_event *event, void *arg) {
+    BLEServer* server = (BLEServer*)arg;
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+#ifdef CONFIG_BLE_DEBUG
+            ESP_LOGI("BLE", "Client connected (handle=%d)", event->connect.conn_handle);
+#endif
+            server->onConnect(event->connect.conn_handle);
+            break;
+
+        case BLE_GAP_EVENT_DISCONNECT:
+#ifdef CONFIG_BLE_DEBUG
+            ESP_LOGI("BLE", "Client disconnected (reason=0x%02x)", event->disconnect.reason);
+#endif
+            server->onDisconnect();
+            break;
+        case BLE_GAP_EVENT_NOTIFY_TX:
+            if (event->notify_tx.status == 0) {
+                server->resetHeartbeatTimer();
+            }
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
 BLECharacteristic::BLECharacteristic(uint16_t uuid)
 {
+    m_data.uuid = uuid;
     m_chrUUID = BLE_UUID16_INIT(uuid);
     m_characteristicDef = {
         .uuid = &m_chrUUID.u,
@@ -102,6 +119,7 @@ BLECharacteristic::BLECharacteristic(uint16_t uuid)
         .arg = this,
         .descriptors = nullptr,
         .flags = 0,
+        .min_key_size = 0,
         .val_handle = &this->m_data.handle,
         .cpfd = nullptr
     };
@@ -129,9 +147,32 @@ void BLECharacteristic::addRead(OutboundFunc onRead) {
 }
 
 BLECharacteristic* BLECharacteristic::addOperation(uint32_t opCode, OperationFunc onWrite) {
+    if (m_opCallbacks.find(opCode) != m_opCallbacks.end()) {
+        return this;
+    }
     m_opCallbacks[opCode] = onWrite;
     m_data.property |= BLE_GATT_CHR_F_WRITE;
     return this;
+}
+void BLECharacteristic::setNotify(const uint8_t* value, uint16_t valueLen, uint16_t intervalMS) {
+    m_notifyInterval = intervalMS;
+    if (valueLen > BLE_ATT_MTU_MAX) {
+        ESP_LOGW(TAG, "Notify value too long: %d", valueLen);
+    }
+    if (valueLen && value) {
+        m_notifyValue.assign(value, value + valueLen);
+    }
+    m_data.property |= BLE_GATT_CHR_F_NOTIFY;
+}
+void BLECharacteristic::setIndicate(const uint8_t* value, uint16_t valueLen, uint16_t intervalMS) {
+    m_indicateInterval = intervalMS;
+    if (valueLen > BLE_ATT_MTU_MAX) {
+        ESP_LOGW(TAG, "Indicate value too long: %d", valueLen);
+    }
+    if (valueLen && value) {
+        m_indicateValue.assign(value, value + valueLen);
+    }
+    m_data.property |= BLE_GATT_CHR_F_INDICATE;
 }
 
 const ble_gatt_chr_def& BLECharacteristic::getDef() {
@@ -157,7 +198,31 @@ const std::vector<uint32_t> BLECharacteristic::getOpCodes() {
     }
     return m_opCodes;
 }
-
+void BLECharacteristic::tick(uint16_t connHandle) {
+    if (hasProperty(BLE_GATT_CHR_F_NOTIFY)) {
+        if (m_nextNotifyTime <= timeMillis()) {
+            m_nextNotifyTime = timeMillis() + m_notifyInterval;
+            os_mbuf* om = nullptr;
+            if (m_notifyValue.size()) {
+                om = ble_hs_mbuf_from_flat(m_notifyValue.data(), m_notifyValue.size());
+            }
+            ble_gatts_notify_custom(connHandle, m_data.handle, om);
+        }
+    }
+    if (hasProperty(BLE_GATT_CHR_F_INDICATE)) {
+        if (m_nextIndicateTime <= timeMillis()) {
+            m_nextIndicateTime = timeMillis() + m_indicateInterval;
+            os_mbuf* om = nullptr;
+            if (m_indicateValue.size()) {
+                om = ble_hs_mbuf_from_flat(m_indicateValue.data(), m_indicateValue.size());
+            }
+            ble_gatts_indicate_custom(connHandle, m_data.handle, om);
+        }
+    }
+}
+void BLECharacteristic::reset() {
+ 
+}
 //=============================================================================
 // BLEService
 
@@ -174,7 +239,11 @@ BLEService::~BLEService() {
 }
 
 BLECharacteristic* BLEService::createCharacteristic(uint16_t uuid) {
-    BLECharacteristic* chr = new BLECharacteristic(uuid);
+    BLECharacteristic* chr = getCharacteristic(uuid);
+    if (chr) {
+        return chr;
+    }
+    chr = new BLECharacteristic(uuid);
     m_Characteristics.emplace_back(chr);
     return chr;
 }
@@ -197,25 +266,28 @@ const std::vector<ble_gatt_chr_def>& BLEService::getCharacteristicsDefs() {
     return m_CharacteristicDefs;
 }
 
-void ble_server_task(void *param)
-{
-    xEventGroupWaitBits(g_startEvent, BLE_SERVER_START_BIT, true, true, portMAX_DELAY);
-    nimble_port_run();
-    if (g_slaveTask) {
-        vTaskDelete(g_slaveTask);
-        g_slaveTask = nullptr;
+void BLEService::tick(uint16_t connHandle) {
+    for (auto& chr : m_Characteristics) {
+        chr->tick(connHandle);
     }
 }
+void BLEService::reset() {
+    for (auto& chr : m_Characteristics) {
+        chr->reset();
+    }
+}
+//======================================
+// BLEServer
+struct ble_gap_event_listener gap_event_listener;
 
 BLEServer::BLEServer()
 {
+    m_startEvent = xEventGroupCreate();
 }
 
 BLEServer::~BLEServer()
 {
-    for (auto& s : m_services) {
-        delete s;
-    }
+    shutdown();
 }
 
 void BLEServer::init(uint16_t vendorId, std::string deviceName)
@@ -231,7 +303,9 @@ void BLEServer::init(uint16_t vendorId, std::string deviceName)
     ESP_ERROR_CHECK(ret);
     // Initialize NimBLE
     // Set server MTU to 247 bytes, so notifications can be larger
+#ifdef CONFIG_BLE_DEBUG
     printf("BLE_ATT_MTU_MAX = %d\n", BLE_ATT_MTU_MAX);
+#endif
     // ble_att_set_preferred_mtu(23);
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
@@ -240,49 +314,80 @@ void BLEServer::init(uint16_t vendorId, std::string deviceName)
     }
     ble_svc_gap_init();
     ble_svc_gatt_init();
-
-    xTaskCreatePinnedToCore(ble_server_task, "nimble_server", NIMBLE_HS_STACK_SIZE,
-                            NULL, (configMAX_PRIORITIES - 4), &g_slaveTask, NIMBLE_CORE);
-}
-
-void BLEServer::deinit()
-{
+    // Register gap event callback
+    int rc = ble_gap_event_listener_register(&gap_event_listener, ble_gap_event, this);
+    if (rc != 0) {
+        ESP_LOGE(TAG,"Failed to register gap event listener %d", rc);
+        return;
+    }
+    xTaskCreatePinnedToCore([](void* param) {
+        EventGroupHandle_t startEvent = (EventGroupHandle_t)param;
+        xEventGroupWaitBits(startEvent, BLE_SERVER_START_BIT, true, true, portMAX_DELAY);
+        nimble_port_run();
+    }, "nimble server task", NIMBLE_HS_STACK_SIZE, m_startEvent, (configMAX_PRIORITIES - 4), &m_mainTask, NIMBLE_CORE);
+    // Create default service & characteristic
+    auto chr = createService(CUBICAT_SERVICE_UUID)->createCharacteristic(CUBICAT_PROTOCOL_CHAR_UUID);
+    // Indicate for heartbeat
+    chr->setIndicate(nullptr, 0, 1000);
+    rc = xTaskCreatePinnedToCore([](void* param) {
+        while (((BLEServer*)param)->tick())
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }, "server loop task", 4096, this, 1, &m_loopTask, NIMBLE_CORE);
+    if (rc < 0) {
+        ESP_LOGE(TAG, "Failed to create loop task %d", rc);
+    }
 }
 
 BLEService* BLEServer::createService(uint16_t uuid)
 {  
-    auto service = new BLEService(uuid);
+    BLEService* service = getService(uuid);
+    if (service) {
+        return service;
+    }
+    service = new BLEService(uuid);
     m_services.emplace_back(service);
     return service;
+}
+
+BLEService* BLEServer::getService(uint16_t uuid) {
+    for (auto& s : m_services) {
+        if (s->m_data.uuid == uuid) {
+            return s;
+        }
+    }
+    return nullptr;
 }
 
 uint8_t calculate_adv_length(const struct ble_hs_adv_fields *fields) {
     uint8_t total_len = 0;
 
-    // 1. Flags 字段（固定 3 字节：1长度 + 1类型 + 1值）
+    // 1. Flags field（fixed 3 bytes：1 length + 1 type + 1 value）
     if (fields->flags != 0) {
         total_len += 3;  // 0x02 0x01 <flags>
     }
-
-    // 2. 16-bit UUIDs 字段
+    // 2. 16-bit UUIDs 
     if (fields->uuids16 != NULL && fields->num_uuids16 > 0) {
-        // 长度 = 1字节长度 + 1字节类型 + N*2字节UUID
+        // bytes = 1 length + 1 type + N*sizeof(uint16_t) UUID
         total_len += 1 + 1 + fields->num_uuids16 * 2;
     }
 
-    // 3. 设备名称字段
+    // 3. Device name field
     if (fields->name != NULL && fields->name_len > 0) {
-        // 长度 = 1字节长度 + 1字节类型 + name_len字节数据
+        // bytes = 1 length + 1 type + name_len bytes
         total_len += 1 + 1 + fields->name_len;
     }
 
-    // 4. 厂商数据字段
+    // 4. Vendor specific data
     if (fields->mfg_data != NULL && fields->mfg_data_len > 0) {
-        // 长度 = 1字节长度 + 1字节类型 + mfg_data_len字节数据
+        // bytes = 1 length + 1 type + mfg_data_len bytes
         total_len += 1 + 1 + fields->mfg_data_len;
     }
+#ifdef CONFIG_BLE_DEBUG
     printf("Advertisement len = %d\n", total_len);
-    // 确保不超过 BLE 4.x 的 31 字节限制
+#endif
+    // Make sure we don't exceed BLE 4.x's 31 bytes limitation
     return (total_len <= 31) ? total_len : 31;
 }
 
@@ -304,7 +409,7 @@ void BLEServer::start()
         ble_svc_gap_device_name_set(m_deviceName.c_str());
     }
     // Register custom services
-    m_ServiceDefs.clear();
+    m_serviceDefs.clear();
     for (auto& service : m_services) {
         const auto& defs = service->getCharacteristicsDefs();
         serviceUUIDs.emplace_back(service->getUUID16());
@@ -313,30 +418,21 @@ void BLEServer::start()
             .uuid = &service->getUUID16().u,
             .characteristics = &defs.data()[0],
         };
-        m_ServiceDefs.emplace_back(serviceDef);
+        m_serviceDefs.emplace_back(serviceDef);
     }
-    m_ServiceDefs.push_back({ 0 });
-    rc = ble_gatts_count_cfg(m_ServiceDefs.data());
+    m_serviceDefs.push_back({ 0 });
+    rc = ble_gatts_count_cfg(m_serviceDefs.data());
     if (rc != 0) {
         ESP_LOGE(TAG,"Error: Failed to count configuration; rc=%d", rc);
         return;
     }
-    rc = ble_gatts_add_svcs(m_ServiceDefs.data());
+    rc = ble_gatts_add_svcs(m_serviceDefs.data());
     if (rc != 0) {
         ESP_LOGE(TAG,"Error: Failed to add services; rc=%d", rc);
         return;
     }
-    // Adv parameters
-    struct ble_gap_adv_params adv_params = {
-        .conn_mode = BLE_GAP_CONN_MODE_UND,  // 可连接的非定向广播
-        .disc_mode = BLE_GAP_DISC_MODE_GEN,  // 通用发现模式
-        .itvl_min = 0x0025,
-        .itvl_max = 0x0050,
-        .channel_map = 0,
-        .filter_policy = 0,
-    };
     // Notify BLE protocol stack that we are ready to start
-    xEventGroupSetBits(g_startEvent, BLE_SERVER_START_BIT);
+    xEventGroupSetBits(m_startEvent, BLE_SERVER_START_BIT);
     // Delay to allow BLE stack to start
     vTaskDelay(200 / portTICK_PERIOD_MS);
 
@@ -364,9 +460,21 @@ void BLEServer::start()
         ESP_LOGE(TAG, "Failed to set advertising fields err: %d", rc);
         return;
     }
-    rc = ble_gap_adv_start(
-        BLE_OWN_ADDR_PUBLIC,      // 使用公共地址
-        nullptr,                  // 无特定的对端地址
+    startAdvertising();
+}
+void BLEServer::startAdvertising() {
+    // Adv parameters
+    struct ble_gap_adv_params adv_params = {
+        .conn_mode = BLE_GAP_CONN_MODE_UND,  // 可连接的非定向广播
+        .disc_mode = BLE_GAP_DISC_MODE_GEN,  // 通用发现模式
+        .itvl_min = 0x0025,
+        .itvl_max = 0x0050,
+        .channel_map = 0,
+        .filter_policy = 0,
+    };
+    int rc = ble_gap_adv_start(
+        BLE_OWN_ADDR_PUBLIC,      // Use public address
+        nullptr,                  // No specific peer address, accept connections from anyone
         BLE_HS_FOREVER,           
         &adv_params,              
         nullptr,                     
@@ -377,6 +485,59 @@ void BLEServer::start()
     } else {
         ESP_LOGI(TAG, "Advertising started successfully");
     }
+}
+void BLEServer::shutdown() {
+    m_bShutdown = true;
+    ble_gap_adv_stop();
+    for (auto& s : m_services) {
+        delete s;
+    }
+    xTimerDelete(m_timeoutTimer, 1000/portTICK_PERIOD_MS);
+    vTaskDelete(m_mainTask);
+    // Wait for loop task to exit
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    vTaskDelete(m_loopTask);
+    vEventGroupDelete(m_startEvent);
+    m_loopTask = nullptr;
+    m_mainTask = nullptr;
+    m_startEvent = nullptr;
+    nimble_port_stop();
+}
+void BLEServer::onConnect(uint16_t connHandle)
+{
+    m_bConnected = true;
+    m_nClientConnHandle = connHandle;
+    m_nlastHeartbeat = timeMillis();
+    // Create a connection timeout timer for 3 seconds
+    m_timeoutTimer = xTimerCreate("Timeout task", 3000 / portTICK_PERIOD_MS, false, this, [](TimerHandle_t xTimer) {
+        void* pvTimerID = pvTimerGetTimerID(xTimer);
+        ((BLEServer*)pvTimerID)->onDisconnect();
+    });
+    xTimerStart(m_timeoutTimer, 0);
+}
+void BLEServer::onDisconnect() {
+    if (m_bConnected) {
+        m_bConnected = false;
+        m_nClientConnHandle = 0;
+        // Reset start advertising
+        for (auto& service : m_services) {
+            service->reset();
+        }
+        startAdvertising();
+    }
+}
+bool BLEServer::tick() {
+    if (m_bConnected) {
+        for (auto& service : m_services) {
+            service->tick(m_nClientConnHandle);
+        }
+    }
+    return !m_bShutdown;
+}
+
+void BLEServer::resetHeartbeatTimer() {
+    m_nlastHeartbeat = timeMillis();
+    xTimerReset(m_timeoutTimer, 3000 / portTICK_PERIOD_MS);
 }
 
 #endif // CONFIG_BT_ENABLED

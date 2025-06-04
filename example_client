@@ -12,15 +12,21 @@ extern "C" void app_main()
     bleClient->init();
     bleClient->scan(ScanPolicy::SCAN_ONLY_CUBICAT);
     bleClient->setConnectedCallback([=](uint16_t connHandle) {
+        // 获取Cubicat协议特征
         auto chr = bleClient->getCharacteristicByUUID(connHandle, CUBICAT_PROTOCOL_CHAR_UUID);
-        // 检查特征是否有指定的操作，在这里就是开灯操作
+        if (!chr) {
+            return;
+        }
+        // 检查协议是否有指定的操作，以灯操作举例
         for (auto op : chr->opCodes) {
-            if (op == OP_LIGHT_SWITCH) {
-                bleClient->write(connHandle, CUBICAT_PROTOCOL_CHAR_UUID, BLEProtocol(OP_LIGHT_SWITCH, 1));
-                bleClient->read(connHandle, CUBICAT_PROTOCOL_CHAR_UUID, [=](ExBuffer value) {
-                    
-                });
-            }
+            if (op == OP_GENERIC_SWITCH) { // 如果协议里有开关的操作码，说明设备有开关功能
+                // 写入开灯指令
+                bleClient->write(connHandle, CUBICAT_PROTOCOL_CHAR_UUID, BLEProtocol(OP_GENERIC_SWITCH, 1));
+            } else if (op == OP_LIGHT_BRIGHTNESS) { // 如果协议里有灯亮度的操作码，说明设备有明暗调节功能
+                // 写入亮度指令
+                bleClient->write(connHandle, CUBICAT_PROTOCOL_CHAR_UUID, BLEProtocol(OP_LIGHT_BRIGHTNESS, 100));
+            } 
+            // else if ... add more
         }
     });
     while (1)

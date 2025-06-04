@@ -27,19 +27,20 @@ TaskHandle_t            g_hostTask = nullptr;
 
 #define BLECENT_SVC_ALERT_UUID              0x1811
 #define TAG "BLE_CLIENT"
+#define LOOP_TASK_EVENT_BIT                 BIT0
 
 extern "C" void ble_store_config_init();
 
 static int gap_event_callback(struct ble_gap_event *event, void *arg);
 static int chr_disc_callback(uint16_t conn_handle, const struct ble_gatt_error *error,
                           const struct ble_gatt_chr *chr, void *arg);
-
-static void blemesh_on_reset(int reason)
+uint32_t timeMillis() { return esp_timer_get_time() / 1000; }
+static void ble_on_reset(int reason)
 {
     ESP_LOGI(TAG, "Resetting state; reason=%d\n", reason);
 }
 
-static void blemesh_on_sync(void)
+static void ble_on_sync(void)
 {
 
 }
@@ -57,7 +58,7 @@ int ble_gatt_attr_callback(uint16_t conn_handle,
         // Current chunk data length
         uint16_t chunkLen = OS_MBUF_PKTLEN(attr->om);
         // Cache current chunk
-#ifdef BLE_DEBUG
+#ifdef CONFIG_BLE_DEBUG
         printf("Received %d bytes at offset %d\n", chunkLen, attr->offset);
 #endif
         // Check if there is more data， equal to MTU - 3 mean current package reached max shatt size,there could be more
@@ -78,31 +79,33 @@ int ble_gatt_attr_callback(uint16_t conn_handle,
 }
 
 int ble_gatt_desc_callback(uint16_t conn_handle,
-                             const struct ble_gatt_error *error,
-                             struct ble_gatt_attr *attr,
-                             void *arg)
+                            const struct ble_gatt_error *error,
+                            struct ble_gatt_attr *attr,
+                            void *arg)
 {
     if (error->status != 0) {
         ESP_LOGE(TAG,"Error: Failed to read descriptor; rc=%d", error->status);
         return error->status;
     }
     if (attr) {
-        CharacteristicData* chr = (CharacteristicData*)arg;
+        uint16_t chrUUID = (uint16_t)(uintptr_t)arg;
+        CharacteristicDataSafe chr = BLEClient::getInstance()->getCharacteristicByUUID(conn_handle, chrUUID);
         int c = attr->om->om_len / sizeof(uint32_t);
         unsigned int* data = (unsigned int*)attr->om->om_data;
         for (int i = 0; i < c; i++) {
-            printf("OpCode: 0x%08x\n", data[i]);
-            chr->opCodes.push_back(data[i]);
+#ifdef CONFIG_BLE_DEBUG
+            printf("OpCode: 0x%08x chr %p\n", data[i], chr.ptr);
+#endif
+            chr.ptr->opCodes.push_back(data[i]);
         }
-
     }
     return 0;
 }
 
 void ble_host_task(void *param)
 {
-    ble_hs_cfg.reset_cb = blemesh_on_reset;
-    ble_hs_cfg.sync_cb = blemesh_on_sync;
+    ble_hs_cfg.reset_cb = ble_on_reset;
+    ble_hs_cfg.sync_cb = ble_on_sync;
     // ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
     nimble_port_run();
@@ -145,11 +148,13 @@ static int gap_event_callback(struct ble_gap_event *event, void *arg) {
             return 0;
         }
         ble_gap_disc_desc *disc = &event->disc;
+#ifdef CONFIG_BLE_DEBUG
         printf("发现设备 data: ");
         for (int i = 0; i < disc->length_data; i++) {
             printf("%02X ", disc->data[i]);
         }
         printf("\ndata len: %d \n", disc->length_data);
+#endif
         if (!disc->length_data) {
             return 0;
         }
@@ -173,7 +178,9 @@ static int gap_event_callback(struct ble_gap_event *event, void *arg) {
                 break;
             }
         }
-        printf("发现设备 name: %s, connectable: %d, vendor: %d, hasCubicatService: %d\n", name.c_str(), connectable, vendor, hasCubicatService);
+#ifdef CONFIG_BLE_DEBUG
+        printf("发现设备 name: %s, connectable: %d, vendor: %d, has CubicatService: %d\n", name.c_str(), connectable, vendor, hasCubicatService);
+#endif
         BLEClient::getInstance()->onScanResult(disc->addr.val, disc->addr.type, name, hasCubicatService, vendor, connectable);
     } else if (event->type == BLE_GAP_EVENT_CONNECT) {
         if (event->connect.status == 0) {
@@ -187,54 +194,32 @@ static int gap_event_callback(struct ble_gap_event *event, void *arg) {
             }
             BLEClient::getInstance()->onDeviceConnected(desc.peer_id_addr.val, event->connect.conn_handle);
             // 保存连接信息
+#ifdef CONFIG_BLE_DEBUG
             printf("连接成功\n");
+#endif
         } else {
+#ifdef CONFIG_BLE_DEBUG
             printf("连接失败\n");
+#endif
         }
         
     } else if (event->type == BLE_GAP_EVENT_MTU) {
+#ifdef CONFIG_BLE_DEBUG
         printf("Current MTU size: %d\n", event->mtu.value);
+#endif
+    } else if (event->type == BLE_GAP_EVENT_NOTIFY_RX) {
+        BLEClient::getInstance()->onNotificationReceived(event->notify_rx.conn_handle, event->notify_rx.attr_handle, 
+            event->notify_rx.indication, event->notify_rx.om->om_data, event->notify_rx.om->om_len);
     }
     return 0;
 }
 
-void connectToDevice(const uint8_t* macAddr, uint8_t addrType) {
-    // 连接之前必须停止扫描
-    int rc = ble_gap_disc_cancel();
-    if (rc != 0) {
-        MODLOG_DFLT(DEBUG, "Failed to cancel scan; rc=%d\n", rc);
-        return;
-    }
-    static const struct ble_gap_conn_params conn_params = {
-        .scan_itvl = 0x0010,
-        .scan_window = 0x0010,
-        .itvl_min = BLE_GAP_INITIAL_CONN_ITVL_MIN,
-        .itvl_max = BLE_GAP_INITIAL_CONN_ITVL_MAX,
-        .latency = 0,
-        .supervision_timeout = 0x0100,
-        .min_ce_len = 0x0010,
-        .max_ce_len = 0x0300,
-    };
-    ble_addr_t addr;
-    addr.type = addrType;
-    memcpy(addr.val, macAddr, sizeof(MacAddr));
-    rc = ble_gap_connect(
-        BLE_OWN_ADDR_PUBLIC, // 本地地址类型
-        &addr,                // 目标设备地址
-        BLE_HS_FOREVER,      // 持续尝试连接
-        &conn_params,        
-        gap_event_callback, 
-        NULL
-    );
-    if (rc != 0) {
-        printf("连接失败: %d addr: %02X:%02X:%02X:%02X:%02X:%02X type: %d\n", rc,
-             macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5], addrType);
-    }
-}
 // 发现服务器回调
 static int serv_disc_callback(uint16_t conn_handle, const ble_gatt_error *error, const ble_gatt_svc *service, void *arg) {
     if (service) {
+#ifdef CONFIG_BLE_DEBUG
         printf("发现服务 uuid: 0x%04X start: 0x%04X end: 0x%04X\n", service->uuid.u16.value, service->start_handle, service->end_handle);
+#endif
         if (error->status != 0) {
             ESP_LOGE(TAG,"Error: Failed to discover services; rc=%d", error->status);
             return error->status;
@@ -253,7 +238,7 @@ static int chr_disc_callback(uint16_t conn_handle, const struct ble_gatt_error *
         delete servId;
         BLEClient::getInstance()->discoverCharacteristics(conn_handle, true);
     } else {
-        printf("发现特征回调失败 status: %d\n", error->status);
+        ESP_LOGE(TAG,"发现特征回调失败 status: %d\n", error->status);
     }
     return 0;
 }
@@ -264,22 +249,28 @@ static int desc_disc_callback(uint16_t conn_handle, const struct ble_gatt_error 
     if (!dsc) {
         return 0;
     }
-    printf("发现描述 uuid: 0x%04X char val handle: 0x%04X\n", dsc->uuid.u16.value, chr_val_handle);
+#ifdef CONFIG_BLE_DEBUG
+    printf("发现描述 uuid: 0x%04X char val handle: 0x%04X dsc handle: 0x%04X\n", dsc->uuid.u16.value, chr_val_handle, dsc->handle);
+#endif
     if (error->status != 0) {
         // status 10: BLE_HS_EBADDATA
-        printf("发现描述回调失败 chr val handle: 0x%04X status: %d\n", chr_val_handle, error->status);
+        ESP_LOGE(TAG,"发现描述回调失败 chr val handle: 0x%04X status: %d\n", chr_val_handle, error->status);
         return error->status;
     }
-    auto chr = (CharacteristicData*)arg;
     if (dsc->uuid.u16.value == 0x2902) {
+#ifdef CONFIG_BLE_DEBUG
         printf("Found CCCD handle: 0x%04X\n", dsc->handle);
-        chr->cccdHandle = dsc->handle;
+#endif
+        uint16_t chrUUID = (uint16_t)(uintptr_t)arg;
+        CharacteristicDataSafe chr = BLEClient::getInstance()->getCharacteristicByUUID(conn_handle, chrUUID);
+        chr.ptr->cccdHandle = dsc->handle;
         // 开启通知
         uint16_t enableFlag = 0x0000;
-        if (chr->property & PROPERTY_NOTIFY) {
-            enableFlag = 0x0001;
-        } else if (chr->property & PROPERTY_INDICATE) {
-            enableFlag = 0x0002;
+        if (chr.ptr->property & PROPERTY_NOTIFY) {
+            enableFlag |= 0x0001;
+        }
+        if (chr.ptr->property & PROPERTY_INDICATE) {
+            enableFlag |= 0x0002;
         }
         if (enableFlag) {
             int rc = ble_gattc_write_flat(conn_handle, dsc->handle, &enableFlag, sizeof(enableFlag), nullptr, nullptr);
@@ -288,12 +279,10 @@ static int desc_disc_callback(uint16_t conn_handle, const struct ble_gatt_error 
             }
         }
     } else if (dsc->uuid.u16.value == CUBICAT_DESCRIPTOR_UUID) {
-        ble_gattc_read(conn_handle, dsc->handle, ble_gatt_desc_callback, chr);
+        ble_gattc_read(conn_handle, dsc->handle, ble_gatt_desc_callback, arg);
     }
     return 0;
 }
-
-esp_timer_handle_t BLEClient::m_sAutoConnectTimer = nullptr;
 
 BLEClient::BLEClient() {
 }
@@ -308,14 +297,43 @@ void BLEClient::init() {
         ESP_LOGE(TAG,"Failed to init nimble %d ", ret);
         return;
     }
+    if (CONFIG_BT_NIMBLE_GATT_MAX_PROCS <= 4) {
+        ESP_LOGE(TAG,"CONFIG_BT_NIMBLE_GATT_MAX_PROCS must be greater than 4! current: %d", CONFIG_BT_NIMBLE_GATT_MAX_PROCS);
+        return;
+    }
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
     // bt_mesh_proxy_svcs_register();
     ble_store_config_init();
 
-    xTaskCreatePinnedToCoreWithCaps(ble_host_task, "nimble_host", NIMBLE_HS_STACK_SIZE,
-                            NULL, (configMAX_PRIORITIES - 4), &g_hostTask, NIMBLE_CORE, MALLOC_CAP_SPIRAM);
+    xTaskCreatePinnedToCore(ble_host_task, "nimble_host", CONFIG_BT_NIMBLE_TASK_STACK_SIZE,
+                            NULL, (configMAX_PRIORITIES - 4), &g_hostTask, NIMBLE_CORE);
+    m_eventGroup = xEventGroupCreate();
+    m_taskMutex = xSemaphoreCreateBinary();
+    m_chrMutex = xSemaphoreCreateBinary();
+    xSemaphoreGive(m_taskMutex);
+    xSemaphoreGive(m_chrMutex);
+    xTaskCreatePinnedToCore([](void *arg) { 
+        auto client = (BLEClient*)arg;
+        while (true)
+        {
+            auto bits = xEventGroupWaitBits(client->m_eventGroup, LOOP_TASK_EVENT_BIT, true, true, 0);
+            if (bits & LOOP_TASK_EVENT_BIT) {
+                xSemaphoreTake(client->m_taskMutex, portMAX_DELAY);
+                while (!client->m_tasks.empty())
+                {
+                    auto& func = client->m_tasks.front();
+                    func();
+                    client->m_tasks.pop_front();
+                }
+                xSemaphoreGive(client->m_taskMutex);
+            }
+            client->tick();
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        vTaskDelete(NULL);
+    }, "event loop task", CONFIG_BT_NIMBLE_TASK_STACK_SIZE, this, 1, &m_eventLoopTask, NIMBLE_CORE);
 }
 
 void BLEClient::deinit() {
@@ -323,43 +341,95 @@ void BLEClient::deinit() {
     esp_bt_controller_disable();
     esp_bt_controller_deinit();
 #endif
-    if (m_sAutoConnectTimer) {
-        esp_timer_stop(m_sAutoConnectTimer);
-        esp_timer_delete(m_sAutoConnectTimer);
-        m_sAutoConnectTimer = nullptr;
+    if (m_autoConnectTimer) {
+        xTimerStop(m_autoConnectTimer, 0);
+        xTimerDelete(m_autoConnectTimer, 0);
+        m_autoConnectTimer = nullptr;
+    }
+    vEventGroupDelete(m_eventGroup);
+    m_eventGroup = nullptr;
+    if (m_taskMutex) {
+        vSemaphoreDelete(m_taskMutex);
+        m_taskMutex = nullptr;
+    }
+    if (m_chrMutex) {
+        vSemaphoreDelete(m_chrMutex);
+        m_chrMutex = nullptr;
     }
 }
 
 void BLEClient::scan(ScanPolicy policy, bool autoConnect, int connectDelay) {
+    if (m_bScanning)
+        return;
+    m_bScanning = true;
     m_eScanPolicy = policy;
     m_bAutoConnect = autoConnect;
     m_connectDelay = connectDelay;
     uint8_t own_addr_type;
     ble_hs_id_infer_auto(0, &own_addr_type);
     struct ble_gap_disc_params scan_params = {
-        .itvl = 0x60,   // 扫描间隔 (单位: 0.625ms)
-        .window = 0x30, // 扫描窗口 (单位: 0.625ms)
+        .itvl = 320,            // 200ms 扫描间隔 (单位: 0.625ms)
+        .window = 16,           // 10ms 扫描窗口 (单位: 0.625ms)
         .filter_policy = 0,
         .limited = 0,
-        .passive = 0,   // 主动扫描（获取广播数据）
+        .passive = 0,           // 主动扫描（获取广播数据）
         .filter_duplicates = 1, // 过滤重复设备
     };
     ESP_LOGI(TAG, "Starting scan...\n");
     ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &scan_params, gap_event_callback, NULL);
 }
+void BLEClient::rescan() {
+    scan(m_eScanPolicy, m_bAutoConnect, 1);
+}
 
 // Connect to all discovered devices
-void BLEClient::autoConnect(void* arg) {
+void BLEClient::autoConnect() {
     const auto& devices = BLEClient::getInstance()->getAllDevices();
     for (const auto& device : devices) {
         if (device.connectable) {
             connectToDevice(device.macAddr, device.addrType);
         }
     }
-    if (m_sAutoConnectTimer) {
-        esp_timer_stop(m_sAutoConnectTimer);
-        esp_timer_delete(m_sAutoConnectTimer);
-        m_sAutoConnectTimer = nullptr;
+    if (m_autoConnectTimer) {
+        xTimerStop(m_autoConnectTimer, 0);
+        xTimerDelete(m_autoConnectTimer, 0);
+        m_autoConnectTimer = nullptr;
+    }
+}
+
+
+void BLEClient::connectToDevice(const uint8_t* macAddr, uint8_t addrType) {
+    // Must stop scan before connecting
+    int rc = ble_gap_disc_cancel();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to cancel scan; rc=%d\n", rc);
+        return;
+    }
+    m_bScanning = false;
+    static const struct ble_gap_conn_params conn_params = {
+        .scan_itvl = 0x0010,
+        .scan_window = 0x0010,
+        .itvl_min = BLE_GAP_INITIAL_CONN_ITVL_MIN,
+        .itvl_max = BLE_GAP_INITIAL_CONN_ITVL_MAX,
+        .latency = 0,
+        .supervision_timeout = 0x0100,
+        .min_ce_len = 0x0010,
+        .max_ce_len = 0x0300,
+    };
+    ble_addr_t addr;
+    addr.type = addrType;
+    memcpy(addr.val, macAddr, sizeof(MacAddr));
+    rc = ble_gap_connect(
+        BLE_OWN_ADDR_PUBLIC,
+        &addr,
+        BLE_HS_FOREVER,
+        &conn_params,        
+        gap_event_callback, 
+        NULL
+    );
+    if (rc != 0) {
+        ESP_LOGE(TAG, "连接失败: %d addr: %02X:%02X:%02X:%02X:%02X:%02X type: %d\n", rc,
+             macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5], addrType);
     }
 }
 
@@ -389,17 +459,22 @@ const BLEDevice* BLEClient::deviceFound(MacAddr addr, uint8_t addrType, std::str
         .addrType = addrType,
         .connHandle = 0,
         .name = name,
-        .vendor = vendor
+        .vendor = vendor,
+        .services = {},
+        .lastHearBeatTime = 0
     };
-    // Start to connect after first discovery if set as auto connect
-    if (m_devices.empty() && m_bAutoConnect) {
-        const esp_timer_create_args_t timer_args = {
-            .callback = &autoConnect,
-            .arg = nullptr,
-            .name = "AutoConnect",
-        };
-        esp_timer_create(&timer_args, &m_sAutoConnectTimer);
-        esp_timer_start_once(m_sAutoConnectTimer, m_connectDelay * 1000 * 1000); //（Units：us）
+    // Connect to the first device once detected.
+    if (m_bAutoConnect && !m_autoConnectTimer) {
+        m_autoConnectTimer = xTimerCreate("auto connect", pdMS_TO_TICKS(m_connectDelay * 1000), false, this,
+        [](TimerHandle_t xTimer) {
+            void* pvTimerID = pvTimerGetTimerID(xTimer);
+            BLEClient* client = (BLEClient*)pvTimerID;
+            // Push task to event loop
+            client->pushTask([client]() {
+                client->autoConnect();
+            });
+        });
+        xTimerStart(m_autoConnectTimer, 0);
     }
     return &m_devices.emplace_back(device);
 }
@@ -425,32 +500,32 @@ BLEDevice* BLEClient::getDevice(uint16_t connHandle) {
     return nullptr;
 }
 
-CharacteristicData* BLEClient::getCharacteristicByUUID(uint16_t connHandle, uint16_t uuid) {
+CharacteristicDataSafe BLEClient::getCharacteristicByUUID(uint16_t connHandle, uint16_t uuid) {
     auto device = getDevice(connHandle);
     if (device) {
         for (auto& serv : device->services) {
             for (auto& characteristic : serv.chrData) {
                 if (characteristic.uuid == uuid) {
-                    return &characteristic;
+                    return {&characteristic, &m_chrMutex};
                 }
             }
         }
     }
-    return nullptr;
+    return {nullptr, nullptr};
 }
 
-CharacteristicData* BLEClient::getCharacteristicByHanle(uint16_t connHandle, uint16_t handle) {
+CharacteristicDataSafe BLEClient::getCharacteristicByHandle(uint16_t connHandle, uint16_t chrHandle) {
     auto device = getDevice(connHandle);
     if (device) {
         for (auto& characteristic : device->services) {
             for (auto& characteristic : characteristic.chrData) {
-                if (characteristic.handle == handle) {
-                    return &characteristic;
+                if (characteristic.handle == chrHandle) {
+                    return {&characteristic, &m_chrMutex};
                 }
             }
         }
     }
-    return nullptr;
+    return {nullptr, nullptr};
 }
 
 void BLEClient::onDeviceConnected(MacAddr addr, uint16_t connHandle) {
@@ -511,13 +586,15 @@ void BLEClient::discoverCharacteristics(uint16_t connHandle, bool processNext) {
 void BLEClient::onCharacteristicFound(uint16_t connHandle, uint16_t servUUID, uint16_t charUUID, uint16_t handle, uint8_t property) {
     auto device = getDevice(connHandle);
     if (device) {
+#ifdef CONFIG_BLE_DEBUG
         printf("发现特征: UUID=0x%04X, property=0x%02X, handle=%d\n", charUUID, property, handle);
+#endif
         for (auto& serv : device->services) {
             if (serv.uuid == servUUID) {
-                auto& chr = serv.chrData.emplace_back(CharacteristicData(charUUID, handle, property, 0, std::vector<uint32_t>()));
+                serv.chrData.emplace_back(CharacteristicData(charUUID, handle, property, 0, {}));
                 if (charUUID == CUBICAT_PROTOCOL_CHAR_UUID) {
                     // Discover descriptors
-                    int rc = ble_gattc_disc_all_dscs(connHandle, serv.startHandle, serv.endHandle, desc_disc_callback, &chr);
+                    int rc = ble_gattc_disc_all_dscs(connHandle, serv.startHandle, serv.endHandle, desc_disc_callback, (void*)uintptr_t(charUUID));
                     if (rc != 0) {
                         ESP_LOGE(TAG,"Error: Failed to discover descriptors; rc=%d", rc);
                     }
@@ -557,10 +634,10 @@ print_mbuf(const struct os_mbuf *om)
 
 bool BLEClient::read(uint16_t connHandle, uint16_t charUUID, ReadFunc onRead) {
     auto chr = getCharacteristicByUUID(connHandle, charUUID);
-    if (chr) {
+    if (chr.ptr) {
         // 协商MTU读取256字节，暂时不需要ble_gattc_read_long分片读取,如果有需要再修改
         // ble_gattc_read_long(connHandle, chr->handle, 0, ble_gatt_attr_callback, &onRead);
-        ble_gattc_read(connHandle, chr->handle, ble_gatt_attr_callback, &onRead);
+        ble_gattc_read(connHandle, chr.ptr->handle, ble_gatt_attr_callback, &onRead);
         return true;
     }
     return false;
@@ -568,21 +645,20 @@ bool BLEClient::read(uint16_t connHandle, uint16_t charUUID, ReadFunc onRead) {
 
 bool BLEClient::write(uint16_t connHandle, uint16_t charUUID, const uint8_t* data, uint16_t dataLen) {
     auto chr = getCharacteristicByUUID(connHandle, charUUID);
-    if (chr) {
-        bool hasWriteRsp = chr->property & PROPERTY_WRITE_RSP;
-        bool hasWriteNoRsp = chr->property & PROPERTY_WRITE_NO_RSP;
+    if (chr.ptr) {
+        bool hasWriteRsp = chr.ptr->property & PROPERTY_WRITE_RSP;
+        bool hasWriteNoRsp = chr.ptr->property & PROPERTY_WRITE_NO_RSP;
         if (hasWriteRsp || hasWriteNoRsp) {
             auto om = ble_hs_mbuf_from_flat(data, dataLen);
             if (!om) {
                 ESP_LOGE(TAG,"om buffer alloc failed");
                 return false;
             }
-#ifdef BLE_DEBUG
-            printf("write characteristic: %04X, handle: %d, length: %d\n", chr->uuid, chr->handle, dataLen);
+#ifdef CONFIG_BLE_DEBUG
+            printf("write characteristic: %04X, handle: %d, length: %d\n", chr.ptr->uuid, chr.ptr->handle, dataLen);
             print_mbuf(om);
 #endif  
-            printf("has response: %d, has no response: %d\n", hasWriteRsp, hasWriteNoRsp);
-            ble_gattc_write(connHandle, chr->handle, om, hasWriteRsp?ble_gatt_attr_callback:NULL, nullptr);
+            ble_gattc_write(connHandle, chr.ptr->handle, om, hasWriteRsp?ble_gatt_attr_callback:NULL, nullptr);
             return true;
         }
     }
@@ -603,6 +679,41 @@ bool BLEClient::hasService(uint16_t connHandle, uint16_t servUUID) {
         }
     }
     return false;
+}
+void BLEClient::onNotificationReceived(uint16_t connHandle, uint16_t chrHandle, bool indicate, uint8_t* data, uint16_t dataLen) {
+    auto chr = getCharacteristicByHandle(connHandle, chrHandle);
+    if (chr.ptr) {
+        // Heart beat msg
+        if (indicate && chr.ptr->uuid == CUBICAT_PROTOCOL_CHAR_UUID) {
+            getDevice(connHandle)->lastHearBeatTime = timeMillis();
+        }
+    }
+}
+
+void BLEClient::tick() {
+    auto now = timeMillis();
+    bool _rescan = false;
+    xSemaphoreTake(m_chrMutex, portMAX_DELAY);
+    std::vector<BLEDevice> liveDevices;
+    for (auto& dev : m_devices) {
+        if (dev.lastHearBeatTime > 0 && now - dev.lastHearBeatTime >= 3000) {
+            _rescan = true;
+        } else {
+            liveDevices.push_back(dev);
+        }
+    }
+    std::swap(liveDevices, m_devices);
+    xSemaphoreGive(m_chrMutex);
+    if (_rescan) {
+        rescan();
+    }
+}
+
+void BLEClient::pushTask(TaskFunc func) {
+    xSemaphoreTake(m_taskMutex, portMAX_DELAY);
+    m_tasks.push_back(func);
+    xSemaphoreGive(m_taskMutex);
+    xEventGroupSetBits(m_eventGroup, LOOP_TASK_EVENT_BIT);
 }
 
 #endif // 

@@ -1,0 +1,7 @@
+menu "Cubicat BLE Configuration"
+	config BLE_DEBUG
+		bool "Enable debug log"
+		default n
+		help
+			Enable debug log
+endmenu

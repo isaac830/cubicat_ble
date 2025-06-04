@@ -13,14 +13,18 @@ extern "C" void app_main()
     uint16_t vendorId = 0x5555;                 // 厂商标识
     const char* deviceName = "Cubicat Light";   // 设备名称
     server.init(vendorId, deviceName);
-    auto service = server.createService(CUBICAT_SERVICE_UUID);
-    auto chr = service->createCharacteristic(CUBICAT_PROTOCOL_CHAR_UUID);
-    chr->addOperation(OP_LIGHT_SWITCH, [=](uint16_t connHandle, const OPData& value) {
-        // 处理开关指令
-    })->addOperation(OP_LIGHT_BRIGHTNESS, [=](uint16_t connHandle, const OPData& value) {
-        // 处理亮度指令
-    })->addOperation(OP_LIGHT_COLOR, [=](uint16_t connHandle, const OPData& value) {
-        // 处理颜色指令
+    auto chr = server.getService(CUBICAT_SERVICE_UUID)->getCharacteristic(CUBICAT_PROTOCOL_CHAR_UUID);
+    chr->addOperation(OP_GENERIC_SWITCH, [=](uint16_t connHandle, const OPData& data) {
+        uint8_t state = data.value[0];
+        // 执行开关操作
+    })->addOperation(OP_LIGHT_BRIGHTNESS, [=](uint16_t connHandle, const OPData& data) {
+        uint8_t brightness = data.value[0];
+        // 执行亮度操作
+    })->addOperation(OP_LIGHT_COLOR, [=](uint16_t connHandle, const OPData& data) {
+        uint8_t b = data.value[0];
+        uint8_t g = data.value[1];
+        uint8_t r = data.value[2];
+        // 执行颜色操作
     });
     server.start();
     while (1)

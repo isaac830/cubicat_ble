@@ -14,8 +14,10 @@
 #include <functional>
 #include <deque>
 #include "ble_service.h"
-#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include <freertos/timers.h>
 #include "ble_protocol.h"
+#include <list>
 
 // GATT standard properties
 #define PROPERTY_BROADCAST      0x01
@@ -39,15 +41,31 @@ struct BLEDevice {
     std::string     name;
     uint16_t        vendor;
     std::vector<ServiceData> services;
+    uint32_t        lastHearBeatTime;
 };
 
 using ConnectedCallback = std::function<void(uint16_t connId)>;
 using MacAddr = uint8_t[6];
 using ReadFunc = std::function<void(const ExBuffer&)>;
+using TaskFunc = std::function<void(void)>;
 
 enum ScanPolicy {
     SCAN_ONLY_CUBICAT,
     SCAN_ALL_DEVICES
+};
+
+struct CharacteristicDataSafe {
+    CharacteristicDataSafe() = delete;
+    CharacteristicDataSafe(CharacteristicData* chr, SemaphoreHandle_t* sem) : ptr(chr), mutex(sem) {
+        if (mutex)
+            xSemaphoreTake(*mutex, portMAX_DELAY);
+    }
+    ~CharacteristicDataSafe() {
+        if (mutex)
+            xSemaphoreGive(*mutex);
+    }
+    CharacteristicData* ptr;
+    SemaphoreHandle_t* mutex;
 };
 
 class BLEClient {
@@ -67,8 +85,8 @@ public:
     const std::vector<BLEDevice>& getAllDevices();
     BLEDevice* getDevice(MacAddr addr);
     BLEDevice* getDevice(uint16_t connHandle);
-    CharacteristicData* getCharacteristicByUUID(uint16_t connHandle, uint16_t charUUID);
-    CharacteristicData* getCharacteristicByHanle(uint16_t connHandle, uint16_t handle);
+    CharacteristicDataSafe getCharacteristicByUUID(uint16_t connHandle, uint16_t chrUUID);
+    CharacteristicDataSafe getCharacteristicByHandle(uint16_t connHandle, uint16_t chrHandle);
     
     bool read(uint16_t connHandle, uint16_t charUUID, ReadFunc onRead);
     bool write(uint16_t connHandle, uint16_t charUUID, const BLEProtocol& protocol);
@@ -83,23 +101,33 @@ public:
     void onServiceFound(uint16_t connHandle, uint16_t srvcUUID, uint16_t startHandle, uint16_t endHandle);
     void onCharacteristicFound(uint16_t connHandle, uint16_t srvcUUID, uint16_t charUUID, uint16_t handle, uint8_t property);
     void discoverCharacteristics(uint16_t connHandle, bool processNext);
+    void onNotificationReceived(uint16_t connHandle, uint16_t chrHandle, bool indicate, uint8_t* data, uint16_t dataLen);
+    void tick();
 private:
     BLEClient();
     BLEClient(BLEClient const&) = delete;
 
     bool write(uint16_t connHandle, uint16_t charUUID, const uint8_t* data, uint16_t dataLen);
-    static void autoConnect(void* arg);
+    void connectToDevice(const uint8_t* macAddr, uint8_t addrType);
+    void autoConnect();
+    void rescan();
     const BLEDevice* deviceFound(MacAddr addr, uint8_t addrType, std::string name, uint16_t vendor, bool connectable);
-    void getHandleRangeByCharHandle(uint8_t gattc_if, uint16_t charHandle, uint16_t* startHandle, uint16_t* endHandle);
+    void pushTask(TaskFunc task);
     std::vector<BLEDevice>  m_devices;
     ConnectedCallback       m_connectedCB = nullptr;
     // 需要发现的服务队列，BLE只能依次发现
     std::deque<ServiceData> m_discServQueue;
     bool                    m_bServInDiscovering = false;
     bool                    m_bAutoConnect = false;
+    bool                    m_bScanning = false;
     int                     m_connectDelay = 0;
-    static esp_timer_handle_t      m_sAutoConnectTimer;
+    TimerHandle_t           m_autoConnectTimer = nullptr;
+    TaskHandle_t            m_eventLoopTask = nullptr;
+    EventGroupHandle_t      m_eventGroup = nullptr;
     ScanPolicy              m_eScanPolicy;
+    std::list<TaskFunc>     m_tasks;
+    SemaphoreHandle_t       m_taskMutex = nullptr;
+    SemaphoreHandle_t       m_chrMutex = nullptr;
 };
 
 #endif

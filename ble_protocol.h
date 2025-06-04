@@ -37,7 +37,7 @@ public:
         if (len < 6) { 
             return m_ops;
         }
-        uint32_t opCount = data[0];
+        uint8_t opCount = data[0];
         uint8_t* ptr = (uint8_t*)data + 1;
         for (uint32_t i = 0; i < opCount; i++) {
             uint32_t op = (ptr[0] << 24) | (ptr[1] << 16) | (ptr[2] << 8) | ptr[3];
