@@ -91,7 +91,7 @@ public:
     BLEServer();
     ~BLEServer();
 
-    void init(uint16_t vendorId, std::string deviceName = "Cubicat");
+    void init(uint16_t vendorId, std::string deviceName = "Cubicat", uint16_t clientTimeoutMS = 5000);
     BLEService* createService(uint16_t uuid);
     BLEService* getService(uint16_t uuid);
     void start();
@@ -116,6 +116,7 @@ private:
     TaskHandle_t                m_mainTask = nullptr;
     TaskHandle_t                m_loopTask = nullptr;
     std::atomic<bool>           m_bShutdown = false;
+    uint16_t                    m_timeoutMS;
 };
 
 #endif

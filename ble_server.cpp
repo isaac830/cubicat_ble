@@ -290,10 +290,11 @@ BLEServer::~BLEServer()
     shutdown();
 }
 
-void BLEServer::init(uint16_t vendorId, std::string deviceName)
+void BLEServer::init(uint16_t vendorId, std::string deviceName, uint16_t clientTimeoutMS)
 {
     m_deviceName = deviceName;
     m_vendorId = vendorId;
+    m_timeoutMS = clientTimeoutMS;
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -509,7 +510,7 @@ void BLEServer::onConnect(uint16_t connHandle)
     m_nClientConnHandle = connHandle;
     m_nlastHeartbeat = timeMillis();
     // Create a connection timeout timer for 3 seconds
-    m_timeoutTimer = xTimerCreate("Timeout task", 3000 / portTICK_PERIOD_MS, false, this, [](TimerHandle_t xTimer) {
+    m_timeoutTimer = xTimerCreate("Timeout task", pdMS_TO_TICKS(m_timeoutMS), false, this, [](TimerHandle_t xTimer) {
         void* pvTimerID = pvTimerGetTimerID(xTimer);
         ((BLEServer*)pvTimerID)->onDisconnect();
     });
@@ -518,6 +519,7 @@ void BLEServer::onConnect(uint16_t connHandle)
 void BLEServer::onDisconnect() {
     if (m_bConnected) {
         m_bConnected = false;
+        ble_gap_terminate(m_nClientConnHandle, BLE_ERR_CONN_TERM_LOCAL);
         m_nClientConnHandle = 0;
         // Reset start advertising
         for (auto& service : m_services) {

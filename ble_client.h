@@ -75,7 +75,7 @@ public:
         return &instance;
     }
     ~BLEClient();
-    void init();
+    void init(uint16_t serverTimeoutMS = 5000);
     void deinit();
     // @param autoConnect: if true, automatically connect to the first device found
     // @param connectDelay: if autoConnect is true, wait this many seconds before connecting
@@ -128,6 +128,7 @@ private:
     std::list<TaskFunc>     m_tasks;
     SemaphoreHandle_t       m_taskMutex = nullptr;
     SemaphoreHandle_t       m_chrMutex = nullptr;
+    uint16_t                m_timeoutMS;
 };
 
 #endif

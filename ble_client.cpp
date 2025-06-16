@@ -291,7 +291,8 @@ BLEClient::~BLEClient() {
     deinit();
 }
 
-void BLEClient::init() {
+void BLEClient::init(uint16_t serverTimeoutMS) {
+    m_timeoutMS = serverTimeoutMS;
     auto ret = nimble_port_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG,"Failed to init nimble %d ", ret);
@@ -696,13 +697,14 @@ void BLEClient::tick() {
     xSemaphoreTake(m_chrMutex, portMAX_DELAY);
     std::vector<BLEDevice> liveDevices;
     for (auto& dev : m_devices) {
-        if (dev.lastHearBeatTime > 0 && now - dev.lastHearBeatTime >= 3000) {
+        if (dev.lastHearBeatTime > 0 && now - dev.lastHearBeatTime >= m_timeoutMS) {
             _rescan = true;
         } else {
             liveDevices.push_back(dev);
         }
     }
-    std::swap(liveDevices, m_devices);
+    if (liveDevices.size() != m_devices.size())
+        std::swap(liveDevices, m_devices);
     xSemaphoreGive(m_chrMutex);
     if (_rescan) {
         rescan();
