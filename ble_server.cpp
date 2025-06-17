@@ -108,7 +108,13 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     }
     return 0;
 }
-
+TaskHandle_t BLECharacteristic::m_sOperateTaskHandle = NULL;
+QueueHandle_t BLECharacteristic::m_sOperateQueueHandle = NULL;
+struct OPTaskData {
+    OperationFunc   func;
+    uint16_t        connHandle;
+    OPData          data;
+};
 BLECharacteristic::BLECharacteristic(uint16_t uuid)
 {
     m_data.uuid = uuid;
@@ -123,6 +129,20 @@ BLECharacteristic::BLECharacteristic(uint16_t uuid)
         .val_handle = &this->m_data.handle,
         .cpfd = nullptr
     };
+    if (!m_sOperateTaskHandle) {
+        m_sOperateQueueHandle = xQueueCreate(10, sizeof(OPTaskData*));
+        xTaskCreate(&operateTask, "characteristic operate task", 2048, &m_sOperateQueueHandle, 1, &m_sOperateTaskHandle);
+    }
+}
+
+void BLECharacteristic::operateTask(void* arg) {
+    QueueHandle_t* queueHandle = (QueueHandle_t*)arg;
+    while (1) {
+        OPTaskData* data;
+        xQueueReceive(*queueHandle, &data, portMAX_DELAY);
+        data->func(data->connHandle, data->data);
+        delete data;
+    }
 }
 
 void BLECharacteristic::onRead(ExBuffer& value) {
@@ -136,7 +156,10 @@ void BLECharacteristic::onWrite(uint16_t connHandle, const ExBuffer& value) {
     auto ops = protocol.parse(value.data(), value.size());
     for (auto& opPair : ops) {
         if (m_opCallbacks.find(opPair.first) != m_opCallbacks.end()) {
-            m_opCallbacks[opPair.first](connHandle, opPair.second);
+            OperationFunc func = m_opCallbacks[opPair.first];
+            OPTaskData* taskData = new OPTaskData(func, connHandle, opPair.second);
+            xQueueSend(m_sOperateQueueHandle, &taskData, pdMS_TO_TICKS(200));
+            // m_opCallbacks[opPair.first](connHandle, opPair.second);
         }
     }
 }

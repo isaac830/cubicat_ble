@@ -45,6 +45,7 @@ public:
     void onWrite(uint16_t connHandle, const ExBuffer& input);
 private:
     BLECharacteristic(uint16_t uuid);
+    static void operateTask(void* arg);
     const ble_gatt_chr_def& getDef();
     void tick(uint16_t connHandle);
     void reset();
@@ -62,6 +63,8 @@ private:
     std::vector<uint32_t>                       m_opCodes;
     uint32_t            m_nextNotifyTime = 0;
     uint32_t            m_nextIndicateTime = 0;
+    static TaskHandle_t m_sOperateTaskHandle;
+    static QueueHandle_t m_sOperateQueueHandle;
 };
 
 class BLEService {
